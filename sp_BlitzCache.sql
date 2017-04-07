@@ -204,6 +204,9 @@ CREATE TABLE ##bou_BlitzCacheProcs (
         SetOptions VARCHAR(MAX),
         Warnings VARCHAR(MAX)
     );
+
+CREATE CLUSTERED INDEX ix_bc_bcp ON ##bou_BlitzCacheProcs (SPID, SqlHandle, QueryHash, QueryPlanHash, PlanHandle);
+
 GO 
 
 ALTER PROCEDURE dbo.sp_BlitzCache
@@ -871,7 +874,12 @@ BEGIN
         SetOptions VARCHAR(MAX),
         Warnings VARCHAR(MAX)
     );
+
+CREATE CLUSTERED INDEX ix_bc_bcp ON ##bou_BlitzCacheProcs (SPID, SqlHandle, QueryHash, QueryPlanHash, PlanHandle);
+
 END
+
+
 
 DECLARE @DurationFilter_i INT,
 		@MinMemoryPerQuery INT,
@@ -998,6 +1006,15 @@ CREATE TABLE #only_query_hashes (
     query_hash BINARY(8)
 );
 
+IF OBJECT_ID('tempdb..#statements') IS NOT NULL
+	DROP TABLE #statements
+
+IF OBJECT_ID('tempdb..#query_plan') IS NOT NULL
+	DROP TABLE #query_plan
+
+IF OBJECT_ID('tempdb..#relop') IS NOT NULL
+	DROP TABLE #relop
+
 CREATE TABLE #ignore_query_hashes (
     query_hash BINARY(8)
 );
@@ -1032,6 +1049,37 @@ CREATE TABLE #configuration (
     parameter_name VARCHAR(100),
     value DECIMAL(38,0)
 );
+
+CREATE TABLE #statements
+(
+  Id INT IDENTITY (1,1) PRIMARY KEY CLUSTERED,
+  SPID INT,
+  QueryHash BINARY(8),
+  SqlHandle VARBINARY(64),
+  PlanHandle VARBINARY(64),
+  statement XML
+);
+
+CREATE TABLE #query_plan
+(
+  Id INT IDENTITY(1,1) PRIMARY KEY CLUSTERED,
+  SPID INT,
+  QueryHash BINARY(8),
+  SqlHandle VARBINARY(64),
+  PlanHandle VARBINARY(64),
+  query_plan XML
+);
+
+CREATE TABLE #relop
+(
+  Id INT IDENTITY (1,1) PRIMARY KEY CLUSTERED,
+  SPID INT,
+  QueryHash BINARY(8),
+  SqlHandle VARBINARY(64),
+  PlanHandle VARBINARY(64),
+  relop XML
+);
+
 
 RAISERROR(N'Checking plan cache age', 0, 1) WITH NOWAIT;
 WITH x AS (
@@ -1531,7 +1579,7 @@ SELECT TOP (@Top)
        NULL AS QueryPlanHash,
        qs.min_worker_time / 1000.0,
        qs.max_worker_time / 1000.0,
-       CASE WHEN qp.query_plan.value(''declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan";max(//p:RelOp/@Parallel)'', ''float'')  > 0 THEN 1 ELSE 0 END,
+       NULL,
        qs.min_elapsed_time / 1000.0,
        qs.max_elapsed_time / 1000.0,
        age_minutes, 
@@ -1649,7 +1697,7 @@ BEGIN
            qs.query_plan_hash AS QueryPlanHash,
            qs.min_worker_time / 1000.0,
            qs.max_worker_time / 1000.0,
-           CASE WHEN qp.query_plan.value(''declare namespace p="http://schemas.microsoft.com/sqlserver/2004/07/showplan";max(//p:RelOp/@Parallel)'', ''float'')  > 0 THEN 1 ELSE 0 END,
+           NULL,
            qs.min_elapsed_time / 1000.0,
            qs.max_worker_time  / 1000.0,
            age_minutes,
@@ -2007,49 +2055,73 @@ WHERE   ##bou_BlitzCacheProcs.SqlHandle = y.SqlHandle
         AND ##bou_BlitzCacheProcs.PlanHandle IS NULL
 OPTION (RECOMPILE) ;
 
-
-
 /* Testing using XML nodes to speed up processing */
 RAISERROR(N'Begin XML nodes processing', 0, 1) WITH NOWAIT;
+
+RAISERROR(N'Insert for statements', 0, 1) WITH NOWAIT;
 WITH XMLNAMESPACES('http://schemas.microsoft.com/sqlserver/2004/07/showplan' AS p)
-SELECT  QueryHash ,
+INSERT #statements ( SPID, QueryHash, SqlHandle, PlanHandle, statement )
+SELECT  @@SPID,
+		QueryHash ,
         SqlHandle ,
 		PlanHandle,
         q.n.query('.') AS statement
-INTO    #statements
 FROM    ##bou_BlitzCacheProcs p
         CROSS APPLY p.QueryPlan.nodes('//p:StmtSimple') AS q(n) 
 WHERE p.SPID = @@SPID
 OPTION (RECOMPILE) ;
 
+RAISERROR(N'Insert for cursors', 0, 1) WITH NOWAIT;
 WITH XMLNAMESPACES('http://schemas.microsoft.com/sqlserver/2004/07/showplan' AS p)
-INSERT #statements
-SELECT  QueryHash ,
+INSERT #statements ( SPID, QueryHash, SqlHandle, PlanHandle, statement )
+SELECT  @@SPID,
+		QueryHash ,
         SqlHandle ,
 		PlanHandle,
         q.n.query('.') AS statement
 FROM    ##bou_BlitzCacheProcs p
         CROSS APPLY p.QueryPlan.nodes('//p:StmtCursor') AS q(n) 
+WHERE p.SPID = @@SPID
 OPTION (RECOMPILE) ;
 
+CREATE NONCLUSTERED INDEX ix_statements ON #statements (QueryHash, SqlHandle, SPID, PlanHandle)
+--CREATE PRIMARY XML INDEX ix_bc_statements ON #statements (statement);
+--CREATE XML INDEX path_statements ON #statements (statement) USING XML INDEX ix_bc_statements FOR PATH
+--CREATE XML INDEX value_statements ON #statements (statement) USING XML INDEX ix_bc_statements FOR VALUE
+
+RAISERROR(N'Insert for query plans', 0, 1) WITH NOWAIT;
 WITH XMLNAMESPACES('http://schemas.microsoft.com/sqlserver/2004/07/showplan' AS p)
-SELECT  QueryHash ,
+INSERT #query_plan ( SPID, QueryHash, SqlHandle, query_plan )
+SELECT  @@SPID,
+		QueryHash ,
         SqlHandle ,
         q.n.query('.') AS query_plan
-INTO    #query_plan
 FROM    #statements p
-        CROSS APPLY p.statement.nodes('//p:QueryPlan') AS q(n) 
+        CROSS APPLY p.statement.nodes('//p:QueryPlan') AS q(n)
+WHERE p.SPID = @@SPID
 OPTION (RECOMPILE) ;
 
+CREATE NONCLUSTERED INDEX ix_queryplan ON #query_plan (SqlHandle, QueryHash, SPID)
+--CREATE PRIMARY XML INDEX ix_bc_queryplan ON #query_plan (query_plan);
+--CREATE XML INDEX path_query_plan ON #query_plan (query_plan) USING XML INDEX ix_bc_queryplan FOR PATH
+--CREATE XML INDEX value_query_plan ON #query_plan (query_plan) USING XML INDEX ix_bc_queryplan FOR VALUE
+
+RAISERROR(N'Insert for relop', 0, 1) WITH NOWAIT;
 WITH XMLNAMESPACES('http://schemas.microsoft.com/sqlserver/2004/07/showplan' AS p)
-SELECT  QueryHash ,
+INSERT #relop ( SPID, QueryHash, SqlHandle, relop )
+SELECT  @@SPID,
+		QueryHash ,
         SqlHandle ,
         q.n.query('.') AS relop
-INTO    #relop
 FROM    #query_plan p
         CROSS APPLY p.query_plan.nodes('//p:RelOp') AS q(n) 
+WHERE p.SPID = @@SPID
 OPTION (RECOMPILE) ;
 
+CREATE NONCLUSTERED INDEX ix_relop ON #relop (SqlHandle, SPID, QueryHash)
+--CREATE PRIMARY XML INDEX ix_bc_relop ON #relop (relop);
+--CREATE XML INDEX path_relop ON #relop (relop) USING XML INDEX ix_bc_relop FOR PATH
+--CREATE XML INDEX value_relop ON #relop (relop) USING XML INDEX ix_bc_relop FOR VALUE
 
 
 -- high level plan stuff
@@ -2077,7 +2149,7 @@ SET     compile_timeout = 1
 FROM    #statements s
 JOIN ##bou_BlitzCacheProcs b
 ON  s.QueryHash = b.QueryHash
-AND SPID = @@SPID
+AND b.SPID = s.SPID
 WHERE statement.exist('/p:StmtSimple/@StatementOptmEarlyAbortReason[.="TimeOut"]') = 1
 OPTION (RECOMPILE);
 
@@ -2088,7 +2160,7 @@ SET     compile_memory_limit_exceeded = 1
 FROM    #statements s
 JOIN ##bou_BlitzCacheProcs b
 ON  s.QueryHash = b.QueryHash
-AND SPID = @@SPID
+AND s.SPID = b.SPID
 WHERE statement.exist('/p:StmtSimple/@StatementOptmEarlyAbortReason[.="MemoryLimitExceeded"]') = 1
 OPTION (RECOMPILE);
 
@@ -2102,13 +2174,14 @@ unparameterized_query AS (
                                           statement.exist('//p:StmtSimple[@StatementOptmLevel[.="FULL"]]/*/p:RelOp/descendant::p:ScalarOperator/p:Identifier/p:ColumnReference[contains(@Column, "@")]') = 1 THEN 1
                                 END
 	FROM #statements AS s
+	WHERE s.SPID = @@SPID
 			)
 UPDATE b
 SET b.unparameterized_query = u.unparameterized_query
 FROM ##bou_BlitzCacheProcs b
 JOIN unparameterized_query u
 ON  u.QueryHash = b.QueryHash
-AND SPID = @@SPID
+AND b.SPID = @@SPID
 WHERE u.unparameterized_query = 1
 OPTION (RECOMPILE);
 
@@ -2121,6 +2194,7 @@ index_dml AS (
 								 WHEN statement.exist('//p:StmtSimple/@StatementType[.="DROP INDEX"]') = 1 THEN 1
 								 END
 	FROM    #statements s
+	WHERE s.SPID = @@SPID
 			)
 	UPDATE b
 		SET b.index_dml = i.index_dml
@@ -2160,6 +2234,7 @@ INTO #plan_cost
 FROM    #statements s
 CROSS APPLY s.statement.nodes('/p:StmtSimple') AS q(n)
 WHERE statement.value('sum(/p:StmtSimple/@StatementSubTreeCost)', 'float') > 0
+AND s.SPID = @@SPID
 OPTION (RECOMPILE);
 
 RAISERROR(N'Updating statement costs', 0, 1) WITH NOWAIT;
@@ -2175,6 +2250,7 @@ WITH pc AS (
 		ON b.QueryPlanHash = pc.QueryPlanHash
 		OR b.QueryHash = pc.QueryHash
 		WHERE b.QueryType NOT LIKE '%Procedure%'
+		AND b.SPID = @@SPID
 	OPTION (RECOMPILE);
 
 RAISERROR(N'Gathering stored procedure costs', 0, 1) WITH NOWAIT;
@@ -2187,6 +2263,7 @@ RAISERROR(N'Gathering stored procedure costs', 0, 1) WITH NOWAIT;
 	s.SqlHandle
   FROM #statements AS s
   WHERE PlanHandle IS NOT NULL
+  AND s.SPID = @@SPID
 )
 , QueryCostUpdate AS (
   SELECT
@@ -2210,7 +2287,9 @@ UPDATE b
 SET b.QueryPlanCost = 0.0
 FROM ##bou_BlitzCacheProcs b
 WHERE b.QueryPlanCost IS NULL
+AND b.SPID = @@SPID
 OPTION (RECOMPILE);
+
 
 RAISERROR(N'Checking for forced serialization', 0, 1) WITH NOWAIT;
 WITH XMLNAMESPACES('http://schemas.microsoft.com/sqlserver/2004/07/showplan' AS p)
@@ -2218,7 +2297,7 @@ UPDATE  ##bou_BlitzCacheProcs
 SET is_forced_serial = 1
 FROM    #query_plan qp
 WHERE   qp.SqlHandle = ##bou_BlitzCacheProcs.SqlHandle
-AND SPID = @@SPID
+AND ##bou_BlitzCacheProcs.SPID = @@SPID
 AND query_plan.exist('/p:QueryPlan/@NonParallelPlanReason') = 1
 OPTION (RECOMPILE);
 
@@ -2228,7 +2307,7 @@ UPDATE  ##bou_BlitzCacheProcs
 SET plan_warnings = 1
 FROM    #query_plan qp
 WHERE   qp.SqlHandle = ##bou_BlitzCacheProcs.SqlHandle
-AND SPID = @@SPID
+AND ##bou_BlitzCacheProcs.SPID = @@SPID
 AND query_plan.exist('/p:QueryPlan/p:Warnings') = 1
 OPTION (RECOMPILE);
 
@@ -2238,7 +2317,7 @@ UPDATE  ##bou_BlitzCacheProcs
 SET implicit_conversions = 1
 FROM    #query_plan qp
 WHERE   qp.SqlHandle = ##bou_BlitzCacheProcs.SqlHandle
-AND SPID = @@SPID
+AND ##bou_BlitzCacheProcs.SPID = @@SPID
 AND query_plan.exist('/p:QueryPlan/p:Warnings/p:PlanAffectingConvert/@Expression[contains(., "CONVERT_IMPLICIT")]') = 1
 OPTION (RECOMPILE);
 
@@ -2254,8 +2333,23 @@ FROM   ##bou_BlitzCacheProcs p
                    relop.value('sum(/p:RelOp/@EstimateRewinds)', 'float') + relop.value('sum(/p:RelOp/@EstimateRebinds)', 'float') + 1.0 AS estimated_executions 
             FROM   #relop qs
        ) AS x ON p.SqlHandle = x.SqlHandle
-WHERE SPID = @@SPID
+WHERE p.SPID = @@SPID
 OPTION (RECOMPILE);
+
+RAISERROR(N'Performing parallelism check', 0, 1) WITH NOWAIT;
+WITH XMLNAMESPACES('http://schemas.microsoft.com/sqlserver/2004/07/showplan' AS p)
+UPDATE p
+SET    p.is_parallel = CASE WHEN x.is_parallel = 1 THEN 1 END
+FROM   ##bou_BlitzCacheProcs p
+       JOIN (
+			SELECT r.SqlHandle,
+				   1 AS is_parallel
+			FROM #relop AS r
+			WHERE r.relop.exist('//p:RelOp/@Parallel[.="1"]') = 1
+       ) AS x ON p.SqlHandle = x.SqlHandle
+WHERE p.SPID = @@SPID
+OPTION (RECOMPILE);
+
 
 RAISERROR(N'Performing TVF join check', 0, 1) WITH NOWAIT;
 WITH XMLNAMESPACES('http://schemas.microsoft.com/sqlserver/2004/07/showplan' AS p)
@@ -2269,7 +2363,7 @@ FROM   ##bou_BlitzCacheProcs p
 			WHERE r.relop.exist('//p:RelOp[(@LogicalOp[.="Table-valued function"])]') = 1
 			AND   r.relop.exist('//p:RelOp[contains(@LogicalOp, "Join")]') = 1
        ) AS x ON p.SqlHandle = x.SqlHandle
-WHERE SPID = @@SPID
+WHERE p.SPID = @@SPID
 OPTION (RECOMPILE);
 
 RAISERROR(N'Checking for operator warnings', 0, 1) WITH NOWAIT;
@@ -2369,7 +2463,7 @@ FROM   #relop qs
 WHERE [relop].exist('/p:RelOp[(@PhysicalOp[.="Sort"])]') = 1
 ) AS x
 WHERE ##bou_BlitzCacheProcs.SqlHandle = x.SqlHandle
-AND SPID = @@SPID
+AND ##bou_BlitzCacheProcs.SPID = @@SPID
 OPTION (RECOMPILE) ;
 
 RAISERROR(N'Checking for icky cursors', 0, 1) WITH NOWAIT;
@@ -2381,7 +2475,7 @@ FROM ##bou_BlitzCacheProcs b
 JOIN #statements AS qs
 ON b.SqlHandle = qs.SqlHandle
 CROSS APPLY qs.statement.nodes('/p:StmtCursor') AS n1(fn)
-WHERE SPID = @@SPID
+WHERE b.SPID = @@SPID
 OPTION (RECOMPILE) ;
 
 
@@ -2419,7 +2513,8 @@ CROSS APPLY qs.relop.nodes('//p:TableScan') AS q(n)
 WHERE SPID = @@SPID
 OPTION (RECOMPILE) ;
 
-
+IF @v >= 12
+BEGIN
 RAISERROR(N'Checking for ColumnStore queries operating in Row Mode instead of Batch Mode', 0, 1) WITH NOWAIT;
 WITH XMLNAMESPACES('http://schemas.microsoft.com/sqlserver/2004/07/showplan' AS p)
 UPDATE ##bou_BlitzCacheProcs
@@ -2434,7 +2529,7 @@ WHERE [relop].exist('/p:RelOp/p:IndexScan[(@Storage[.="ColumnStore"])]') = 1
 WHERE ##bou_BlitzCacheProcs.SqlHandle = x.SqlHandle
 AND SPID = @@SPID
 OPTION (RECOMPILE) ;
-
+END;
 
 RAISERROR(N'Checking for computed columns that reference scalar UDFs', 0, 1) WITH NOWAIT;
 WITH XMLNAMESPACES('http://schemas.microsoft.com/sqlserver/2004/07/showplan' AS p)
@@ -2517,7 +2612,7 @@ SET b.index_insert_count = iops.index_insert_count,
 	b.table_delete_count = iops.table_delete_count
 FROM ##bou_BlitzCacheProcs AS b
 JOIN iops ON  iops.SqlHandle = b.SqlHandle
-WHERE SPID = @@SPID
+WHERE b.SPID = @@SPID
 OPTION(RECOMPILE);
 
 RAISERROR(N'Checking for Spatial index use', 0, 1) WITH NOWAIT;
@@ -2532,7 +2627,7 @@ CROSS APPLY relop.nodes('/p:RelOp//p:Object') n(fn)
 WHERE n.fn.exist('(@IndexKind[.="Spatial"])') = 1
 ) AS x
 WHERE ##bou_BlitzCacheProcs.SqlHandle = x.SqlHandle
-AND SPID = @@SPID
+AND ##bou_BlitzCacheProcs.SPID = @@SPID
 OPTION (RECOMPILE);
 
 IF @v >= 12
@@ -2544,7 +2639,7 @@ BEGIN
     SET     downlevel_estimator = CASE WHEN statement.value('min(//p:StmtSimple/@CardinalityEstimationModelVersion)', 'int') < (@v * 10) THEN 1 END
     FROM    ##bou_BlitzCacheProcs p
             JOIN #statements s ON p.QueryHash = s.QueryHash 
-	WHERE SPID = @@SPID
+	WHERE p.SPID = @@SPID
 	OPTION (RECOMPILE) ;
 END ;
 
@@ -2557,7 +2652,7 @@ BEGIN
     SET     p.is_row_level = 1
     FROM    ##bou_BlitzCacheProcs p
             JOIN #statements s ON p.QueryHash = s.QueryHash 
-	WHERE SPID = @@SPID
+	WHERE p.SPID = @@SPID
 	AND statement.exist('/p:StmtSimple/@SecurityPolicyApplied[.="true"]') = 1
 	OPTION (RECOMPILE) ;
 END ;
@@ -2576,7 +2671,7 @@ SET     missing_index_count = query_plan.value('count(//p:QueryPlan/p:MissingInd
         CompileMemory = query_plan.value('sum(//p:QueryPlan/@CompileMemory)', 'float')
 FROM    #query_plan qp
 WHERE   qp.QueryHash = ##bou_BlitzCacheProcs.QueryHash
-AND SPID = @@SPID
+AND ##bou_BlitzCacheProcs.SPID = @@SPID
 OPTION (RECOMPILE);
 
 
@@ -2593,7 +2688,7 @@ SELECT COUNT(DISTINCT QueryHash) AS distinct_plan_count,
        COUNT(QueryHash) AS number_of_plans,
        QueryHash
 FROM   ##bou_BlitzCacheProcs
-WHERE SPID = @@SPID
+WHERE ##bou_BlitzCacheProcs.SPID = @@SPID
 GROUP BY QueryHash
 ) AS x
 WHERE ##bou_BlitzCacheProcs.QueryHash = x.QueryHash 
@@ -2609,7 +2704,7 @@ SET     QueryType = QueryType + ' (parent ' +
 FROM    ##bou_BlitzCacheProcs p
         JOIN sys.dm_exec_procedure_stats s ON p.SqlHandle = s.sql_handle
 WHERE   QueryType = 'Statement'
-AND SPID = @@SPID
+AND p.SPID = @@SPID
 OPTION (RECOMPILE) ;
 
 /* Trace Flag Checks 2014 SP2 and 2016 SP1 only)*/
@@ -2648,7 +2743,7 @@ UPDATE p
 SET    p.trace_flags_session = tf.session_trace_flags
 FROM   ##bou_BlitzCacheProcs p
 JOIN #trace_flags tf ON tf.QueryHash = p.QueryHash 
-WHERE SPID = @@SPID
+WHERE p.SPID = @@SPID
 OPTION(RECOMPILE);
 
 IF @SkipAnalysis = 1
@@ -2767,7 +2862,7 @@ SET    frequent_execution = CASE WHEN ExecutionsPerMinute > @execution_threshold
 	   is_unused_grant = CASE WHEN PercentMemoryGrantUsed <= @memory_grant_warning_percent AND MinGrantKB > @MinMemoryPerQuery THEN 1 END,
 	   long_running_low_cpu = CASE WHEN AverageDuration > AverageCPU * 4 THEN 1 END,
 	   low_cost_high_cpu = CASE WHEN QueryPlanCost < @ctp AND AverageCPU > 500. AND QueryPlanCost * 10 < AverageCPU THEN 1 END
-WHERE SPID = @@SPID
+WHERE ##bou_BlitzCacheProcs.SPID = @@SPID
 OPTION (RECOMPILE) ;
 
 
@@ -2792,7 +2887,7 @@ UPDATE p
 FROM   ##bou_BlitzCacheProcs p
        CROSS APPLY sys.dm_exec_plan_attributes(p.PlanHandle) pa
 WHERE  pa.attribute = 'set_options' 
-AND SPID = @@SPID
+AND p.SPID = @@SPID
 OPTION (RECOMPILE) ;
 
 
@@ -2802,7 +2897,7 @@ SET    is_cursor = CASE WHEN CAST(pa.value AS INT) <> 0 THEN 1 END
 FROM   ##bou_BlitzCacheProcs p
        CROSS APPLY sys.dm_exec_plan_attributes(p.PlanHandle) pa
 WHERE  pa.attribute LIKE '%cursor%' 
-AND SPID = @@SPID
+AND p.SPID = @@SPID
 OPTION (RECOMPILE) ;
 
 
@@ -2865,7 +2960,7 @@ SET    Warnings = CASE WHEN QueryPlan IS NULL THEN 'We couldn''t find a plan for
 				  CASE WHEN long_running_low_cpu = 1 THEN + 'Long Running With Low CPU' ELSE '' END
                   , 2, 200000) 
 				  END
-WHERE SPID = @@SPID
+WHERE ##bou_BlitzCacheProcs.SPID = @@SPID
 				  OPTION (RECOMPILE) ;
 
 
@@ -2930,7 +3025,7 @@ SELECT  DISTINCT
                   , 2, 200000) 
 				  END
 FROM ##bou_BlitzCacheProcs b
-WHERE SPID = @@SPID
+WHERE b.SPID = @@SPID
 AND QueryType LIKE 'Statement (parent%'
 	)
 UPDATE b
@@ -2944,6 +3039,7 @@ OPTION(RECOMPILE);
 UPDATE ##bou_BlitzCacheProcs
 SET Warnings = 'No warnings detected.'
 WHERE Warnings = '' OR	Warnings IS NULL
+AND ##bou_BlitzCacheProcs.SPID = @@SPID
 OPTION (RECOMPILE);
 
 
