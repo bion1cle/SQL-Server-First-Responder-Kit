@@ -1060,6 +1060,8 @@ CREATE TABLE #statements
   statement XML
 );
 
+CREATE NONCLUSTERED INDEX ix_statements ON #statements (QueryHash, SqlHandle, SPID, PlanHandle)
+
 CREATE TABLE #query_plan
 (
   Id INT IDENTITY(1,1) PRIMARY KEY CLUSTERED,
@@ -1070,6 +1072,8 @@ CREATE TABLE #query_plan
   query_plan XML
 );
 
+CREATE NONCLUSTERED INDEX ix_queryplan ON #query_plan (SqlHandle, QueryHash, SPID)
+
 CREATE TABLE #relop
 (
   Id INT IDENTITY (1,1) PRIMARY KEY CLUSTERED,
@@ -1079,6 +1083,23 @@ CREATE TABLE #relop
   PlanHandle VARBINARY(64),
   relop XML
 );
+
+CREATE NONCLUSTERED INDEX ix_relop ON #relop (SqlHandle, SPID, QueryHash)
+
+/*Primary XML Indexes*/
+--CREATE PRIMARY XML INDEX ix_bc_statements ON #statements (statement);
+--CREATE PRIMARY XML INDEX ix_bc_queryplan ON #query_plan (query_plan);
+--CREATE PRIMARY XML INDEX ix_bc_relop ON #relop (relop);
+
+/*Secondary PATH XML Indexes*/
+--CREATE XML INDEX path_statements ON #statements (statement) USING XML INDEX ix_bc_statements FOR PATH
+--CREATE XML INDEX path_query_plan ON #query_plan (query_plan) USING XML INDEX ix_bc_queryplan FOR PATH
+--CREATE XML INDEX path_relop ON #relop (relop) USING XML INDEX ix_bc_relop FOR PATH
+
+/*Secondary VALUE XML Indexes*/
+--CREATE XML INDEX value_statements ON #statements (statement) USING XML INDEX ix_bc_statements FOR VALUE
+--CREATE XML INDEX value_query_plan ON #query_plan (query_plan) USING XML INDEX ix_bc_queryplan FOR VALUE
+--CREATE XML INDEX value_relop ON #relop (relop) USING XML INDEX ix_bc_relop FOR VALUE
 
 
 RAISERROR(N'Checking plan cache age', 0, 1) WITH NOWAIT;
@@ -2084,7 +2105,7 @@ FROM    ##bou_BlitzCacheProcs p
 WHERE p.SPID = @@SPID
 OPTION (RECOMPILE) ;
 
-CREATE NONCLUSTERED INDEX ix_statements ON #statements (QueryHash, SqlHandle, SPID, PlanHandle)
+
 --CREATE PRIMARY XML INDEX ix_bc_statements ON #statements (statement);
 --CREATE XML INDEX path_statements ON #statements (statement) USING XML INDEX ix_bc_statements FOR PATH
 --CREATE XML INDEX value_statements ON #statements (statement) USING XML INDEX ix_bc_statements FOR VALUE
@@ -2101,7 +2122,7 @@ FROM    #statements p
 WHERE p.SPID = @@SPID
 OPTION (RECOMPILE) ;
 
-CREATE NONCLUSTERED INDEX ix_queryplan ON #query_plan (SqlHandle, QueryHash, SPID)
+
 --CREATE PRIMARY XML INDEX ix_bc_queryplan ON #query_plan (query_plan);
 --CREATE XML INDEX path_query_plan ON #query_plan (query_plan) USING XML INDEX ix_bc_queryplan FOR PATH
 --CREATE XML INDEX value_query_plan ON #query_plan (query_plan) USING XML INDEX ix_bc_queryplan FOR VALUE
@@ -2118,11 +2139,10 @@ FROM    #query_plan p
 WHERE p.SPID = @@SPID
 OPTION (RECOMPILE) ;
 
-CREATE NONCLUSTERED INDEX ix_relop ON #relop (SqlHandle, SPID, QueryHash)
+
 --CREATE PRIMARY XML INDEX ix_bc_relop ON #relop (relop);
 --CREATE XML INDEX path_relop ON #relop (relop) USING XML INDEX ix_bc_relop FOR PATH
 --CREATE XML INDEX value_relop ON #relop (relop) USING XML INDEX ix_bc_relop FOR VALUE
-
 
 -- high level plan stuff
 RAISERROR(N'Gathering high level plan information', 0, 1) WITH NOWAIT;
