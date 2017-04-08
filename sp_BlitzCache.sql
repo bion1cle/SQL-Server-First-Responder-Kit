@@ -1002,10 +1002,6 @@ IF OBJECT_ID ('tempdb..#checkversion') IS NOT NULL
 IF OBJECT_ID ('tempdb..#configuration') IS NOT NULL
     DROP TABLE #configuration;
 
-CREATE TABLE #only_query_hashes (
-    query_hash BINARY(8)
-);
-
 IF OBJECT_ID('tempdb..#statements') IS NOT NULL
 	DROP TABLE #statements
 
@@ -1014,6 +1010,10 @@ IF OBJECT_ID('tempdb..#query_plan') IS NOT NULL
 
 IF OBJECT_ID('tempdb..#relop') IS NOT NULL
 	DROP TABLE #relop
+
+CREATE TABLE #only_query_hashes (
+    query_hash BINARY(8)
+);
 
 CREATE TABLE #ignore_query_hashes (
     query_hash BINARY(8)
@@ -1068,7 +1068,6 @@ CREATE TABLE #query_plan
   SPID INT,
   QueryHash BINARY(8),
   SqlHandle VARBINARY(64),
-  PlanHandle VARBINARY(64),
   query_plan XML
 );
 
@@ -1080,11 +1079,15 @@ CREATE TABLE #relop
   SPID INT,
   QueryHash BINARY(8),
   SqlHandle VARBINARY(64),
-  PlanHandle VARBINARY(64),
   relop XML
 );
 
 CREATE NONCLUSTERED INDEX ix_relop ON #relop (SqlHandle, SPID, QueryHash)
+
+/*
+Note: I also stuck the XML index create syntax after the temp table population.
+	  If you want to test the difference between inserting to the index vs. creating the index on inserted data.
+*/
 
 /*Primary XML Indexes*/
 --CREATE PRIMARY XML INDEX ix_bc_statements ON #statements (statement);
