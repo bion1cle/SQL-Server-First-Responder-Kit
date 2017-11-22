@@ -36,8 +36,8 @@ AS
 SET NOCOUNT ON;
 SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 DECLARE @Version VARCHAR(30);
-SET @Version = '5.2';
-SET @VersionDate = '20170406';
+SET @Version = '5.9.5';
+SET @VersionDate = '20171115';
 IF @Help = 1 PRINT '
 /*
 sp_BlitzIndex from http://FirstResponderKit.org
@@ -533,7 +533,9 @@ IF OBJECT_ID('tempdb..#TemporalTables') IS NOT NULL
         )
 
         CREATE TABLE #DatabaseList (
-			DatabaseName NVARCHAR(256)
+			DatabaseName NVARCHAR(256),
+            secondary_role_allow_connections_desc NVARCHAR(50)
+
         )
 
 		CREATE TABLE #PartitionCompressionInfo (
@@ -623,6 +625,32 @@ IF @GetAllDatabases = 1
         AND database_id > 4
         AND DB_NAME(database_id) NOT LIKE 'ReportServer%'
         AND is_distributor = 0;
+
+        /* Skip non-readable databases in an AG - see Github issue #1160 */
+        IF EXISTS (SELECT * FROM sys.all_objects o INNER JOIN sys.all_columns c ON o.object_id = c.object_id AND o.name = 'dm_hadr_availability_replica_states' AND c.name = 'role_desc')
+            BEGIN
+            SET @dsql = N'UPDATE #DatabaseList SET secondary_role_allow_connections_desc = ''NO'' WHERE DatabaseName IN (
+                        SELECT d.name 
+                        FROM sys.dm_hadr_availability_replica_states rs
+                        INNER JOIN sys.databases d ON rs.replica_id = d.replica_id
+                        INNER JOIN sys.availability_replicas r ON rs.replica_id = r.replica_id
+                        WHERE rs.role_desc = ''SECONDARY''
+                        AND r.secondary_role_allow_connections_desc = ''NO'');'
+            EXEC sp_executesql @dsql;
+
+            IF EXISTS (SELECT * FROM #DatabaseList WHERE secondary_role_allow_connections_desc = 'NO')
+                BEGIN
+                INSERT    #BlitzIndexResults ( Priority, check_id, findings_group, finding, database_name, URL, details, index_definition,
+                                                index_usage_summary, index_size_summary )
+                VALUES  ( 1, 0 , 
+		               N'Skipped non-readable AG secondary databases.',
+                       N'You are running this on an AG secondary, and some of your databases are configured as non-readable when this is a secondary node.',
+				       N'To analyze those databases, run sp_BlitzIndex on the primary, or on a readable secondary.',
+                       'http://FirstResponderKit.org', '', '', '', ''
+                        );        
+                END
+            END
+
     END
 ELSE
     BEGIN
@@ -700,7 +728,7 @@ BEGIN CATCH
 DECLARE c1 CURSOR 
 LOCAL FAST_FORWARD 
 FOR 
-SELECT DatabaseName FROM #DatabaseList ORDER BY DatabaseName
+SELECT DatabaseName FROM #DatabaseList WHERE COALESCE(secondary_role_allow_connections_desc, 'OK') <> 'NO' ORDER BY DatabaseName
 
 OPEN c1
 FETCH NEXT FROM c1 INTO @DatabaseName
@@ -983,6 +1011,29 @@ BEGIN TRY
                                 user_lookups, user_updates, last_user_seek, last_user_scan, last_user_lookup, last_user_update,
                                 create_date, modify_date )
                 EXEC sp_executesql @dsql;
+
+
+        RAISERROR (N'Checking partition count',0,1) WITH NOWAIT;
+        IF @BringThePain = 0 AND @SkipPartitions = 0
+            BEGIN
+                /* Count the total number of partitions */
+                SET @dsql = N'SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+                        SELECT @RowcountOUT = SUM(1) FROM ' + QUOTENAME(@DatabaseName) + '.sys.partitions WHERE partition_number > 1 OPTION    ( RECOMPILE );';
+                EXEC sp_executesql @dsql, N'@RowcountOUT BIGINT OUTPUT', @RowcountOUT = @Rowcount OUTPUT;
+                IF @Rowcount > 100
+                    BEGIN
+                        RAISERROR (N'Setting @SkipPartitions = 1 because > 100 partitions were found. To check them, you must set @BringThePain = 1.',0,1) WITH NOWAIT;
+                        SET @SkipPartitions = 1;
+                        INSERT    #BlitzIndexResults ( Priority, check_id, findings_group, finding, URL, details, index_definition,
+                                                        index_usage_summary, index_size_summary )
+                        VALUES  ( 1, 0 , 
+		                       'Some Checks Were Skipped',
+                               '@SkipPartitions Forced to 1',
+                               'http://FirstResponderKit.org', CAST(@Rowcount AS VARCHAR(50)) + ' partitions found. To analyze them, use @BringThePain = 1.', 'We try to keep things quick - and warning, running @BringThePain = 1 can take tens of minutes.', '', ''
+                                );
+                    END
+            END
+
 
 
 		 IF (@SkipPartitions = 0)
@@ -1891,23 +1942,36 @@ BEGIN
     OPTION    ( RECOMPILE );                        
 
     IF (SELECT TOP 1 [object_id] FROM    #MissingIndexes mi) IS NOT NULL
-    BEGIN  
+    BEGIN
+
+	WITH create_date AS (
+						SELECT i.database_id,
+							   i.schema_name,
+							   i.[object_id], 
+							   ISNULL(NULLIF(MAX(DATEDIFF(DAY, i.create_date, SYSDATETIME())), 0), 1) AS create_days
+						FROM #IndexSanity AS i
+						GROUP BY i.database_id, i.schema_name, i.object_id
+						)
         SELECT  N'Missing index.' AS Finding ,
                 N'http://BrentOzar.com/go/Indexaphobia' AS URL ,
                 mi.[statement] + 
                 ' Est. Benefit: '
                     + CASE WHEN magic_benefit_number >= 922337203685477 THEN '>= 922,337,203,685,477'
                     ELSE REPLACE(CONVERT(NVARCHAR(256),CAST(CAST(
-                                        (magic_benefit_number/@DaysUptime)
+                                        (magic_benefit_number / CASE WHEN cd.create_days < @DaysUptime THEN cd.create_days ELSE @DaysUptime END)
                                         AS BIGINT) AS MONEY), 1), '.00', '')
                     END AS [Estimated Benefit],
                 missing_index_details AS [Missing Index Request] ,
                 index_estimated_impact AS [Estimated Impact],
                 create_tsql AS [Create TSQL]
         FROM    #MissingIndexes mi
-        WHERE   [object_id] = @ObjectID
-                /* Minimum benefit threshold = 100k/day of uptime */
-        AND (magic_benefit_number/@DaysUptime) >= 100000
+		LEFT JOIN create_date AS cd
+		ON mi.[object_id] =  cd.object_id 
+		AND mi.database_id = cd.database_id
+		AND mi.schema_name = cd.schema_name
+        WHERE   mi.[object_id] = @ObjectID
+                /* Minimum benefit threshold = 100k/day of uptime OR since table creation date, whichever is lower*/
+        AND (magic_benefit_number / CASE WHEN cd.create_days < @DaysUptime THEN cd.create_days ELSE @DaysUptime END) >= 100000
         ORDER BY is_low, magic_benefit_number DESC
         OPTION    ( RECOMPILE );
     END       
@@ -1929,8 +1993,8 @@ BEGIN
         system_type_name + 
             CASE max_length WHEN -1 THEN N' (max)' ELSE
                 CASE  
-                    WHEN system_type_name IN (N'char',N'nchar',N'binary',N'varbinary') THEN N' (' + CAST(max_length AS NVARCHAR(20)) + N')' 
-                    WHEN system_type_name IN (N'varchar',N'nvarchar') THEN N' (' + CAST(max_length/2 AS NVARCHAR(20)) + N')' 
+                    WHEN system_type_name IN (N'char',N'varchar',N'binary',N'varbinary') THEN N' (' + CAST(max_length AS NVARCHAR(20)) + N')' 
+                    WHEN system_type_name IN (N'nchar',N'nvarchar') THEN N' (' + CAST(max_length/2 AS NVARCHAR(20)) + N')' 
                     ELSE '' 
                 END
             END
@@ -2503,30 +2567,33 @@ BEGIN;
                https://github.com/BrentOzarULTD/SQL-Server-First-Responder-Kit/issues/825
             */
 
-            DECLARE    @number_indexes_with_includes INT;
-            DECLARE    @percent_indexes_with_includes NUMERIC(10, 1);
+			SELECT    database_name,
+					  SUM(CASE WHEN count_included_columns > 0 THEN 1 ELSE 0    END) AS number_indexes_with_includes,
+					  100.* SUM(CASE WHEN count_included_columns > 0 THEN 1 ELSE 0 END) / ( 1.0 * COUNT(*) ) AS percent_indexes_with_includes
+			INTO #index_includes
+            FROM    #IndexSanity
+			GROUP BY database_name;
 
-            SELECT    @number_indexes_with_includes = SUM(CASE WHEN count_included_columns > 0 THEN 1 ELSE 0    END),
-                    @percent_indexes_with_includes = 100.* 
-                        SUM(CASE WHEN count_included_columns > 0 THEN 1 ELSE 0 END) / ( 1.0 * COUNT(*) )
-            FROM    #IndexSanity;
-
-            IF @number_indexes_with_includes = 0 AND NOT (@GetAllDatabases = 1 OR @Mode = 0)
-                INSERT    #BlitzIndexResults ( check_id, index_sanity_id, Priority, findings_group, finding, URL, details, index_definition,
+            IF NOT (@Mode = 0)
+                INSERT    #BlitzIndexResults ( check_id, index_sanity_id, Priority, findings_group, finding, [database_name], URL, details, index_definition,
                                                secret_columns, index_usage_summary, index_size_summary )
-                        SELECT    30 AS check_id, 
+                        SELECT  30 AS check_id, 
                                 NULL AS index_sanity_id, 
                                 250 AS Priority,
                                 N'Feature-Phobic Indexes' AS findings_group,
+								database_name AS [Database Name],
                                 N'No indexes use includes' AS finding, 'http://BrentOzar.com/go/IndexFeatures' AS URL,
                                 N'No indexes use includes' AS details,
-                                @DatabaseName + N' (Entire database)' AS index_definition, 
+                                database_name + N' (Entire database)' AS index_definition, 
                                 N'' AS secret_columns, 
                                 N'N/A' AS index_usage_summary, 
-                                N'N/A' AS index_size_summary OPTION    ( RECOMPILE );
+                                N'N/A' AS index_size_summary 
+						FROM #index_includes
+						WHERE number_indexes_with_includes = 0
+						OPTION    ( RECOMPILE );
 
             RAISERROR(N'check_id 31: < 3 percent of indexes have includes', 0,1) WITH NOWAIT;
-            IF @percent_indexes_with_includes <= 3 AND @number_indexes_with_includes > 0 AND NOT (@GetAllDatabases = 1 OR @Mode = 0)
+            IF NOT (@Mode = 0)
                 INSERT    #BlitzIndexResults ( check_id, index_sanity_id, Priority, findings_group, finding, [database_name], URL, details, index_definition,
                                                secret_columns, index_usage_summary, index_size_summary )
                         SELECT    31 AS check_id,
@@ -2534,42 +2601,45 @@ BEGIN;
                                 150 AS Priority,
                                 N'Feature-Phobic Indexes' AS findings_group,
                                 N'Borderline: Includes are used in < 3% of indexes' AS findings,
-                                @DatabaseName AS [Database Name],
+                                database_name AS [Database Name],
                                 N'http://BrentOzar.com/go/IndexFeatures' AS URL,
-                                N'Only ' + CAST(@percent_indexes_with_includes AS NVARCHAR(10)) + '% of indexes have includes' AS details, 
+                                N'Only ' + CAST(percent_indexes_with_includes AS NVARCHAR(20)) + '% of indexes have includes' AS details, 
                                 N'Entire database' AS index_definition, 
                                 N'' AS secret_columns,
                                 N'N/A' AS index_usage_summary, 
-                                N'N/A' AS index_size_summary OPTION    ( RECOMPILE );
+                                N'N/A' AS index_size_summary
+						FROM #index_includes
+						WHERE number_indexes_with_includes > 0 AND percent_indexes_with_includes <= 3
+						OPTION    ( RECOMPILE );
 
             RAISERROR(N'check_id 32: filtered indexes and indexed views', 0,1) WITH NOWAIT;
-            DECLARE @count_filtered_indexes INT;
-            DECLARE @count_indexed_views INT;
 
-                SELECT    @count_filtered_indexes=COUNT(*)
-                FROM    #IndexSanity
-                WHERE    filter_definition <> '' OPTION    ( RECOMPILE );
-
-                SELECT    @count_indexed_views=COUNT(*)
-                FROM    #IndexSanity AS i
-                        JOIN #IndexSanitySize AS sz ON i.index_sanity_id = sz.index_sanity_id
-                WHERE    is_indexed_view = 1 OPTION    ( RECOMPILE );
-
-            IF @count_filtered_indexes = 0 AND @count_indexed_views=0 AND NOT (@GetAllDatabases = 1 OR @Mode = 0)
+            IF NOT (@Mode = 0)
                 INSERT    #BlitzIndexResults ( check_id, index_sanity_id, Priority, findings_group, finding, [database_name], URL, details, index_definition,
                                                secret_columns, index_usage_summary, index_size_summary )
-                        SELECT    32 AS check_id, 
+                        SELECT  DISTINCT
+								32 AS check_id, 
                                 NULL AS index_sanity_id,
                                 250 AS Priority,
                                 N'Feature-Phobic Indexes' AS findings_group,
                                 N'Borderline: No filtered indexes or indexed views exist' AS finding, 
-                                @DatabaseName AS [Database Name],
+                                i.database_name AS [Database Name],
                                 N'http://BrentOzar.com/go/IndexFeatures' AS URL,
                                 N'These are NOT always needed-- but do you know when you would use them?' AS details,
-                                @DatabaseName + N' (Entire database)' AS index_definition, 
+                                i.database_name + N' (Entire database)' AS index_definition, 
                                 N'' AS secret_columns,
                                 N'N/A' AS index_usage_summary, 
-                                N'N/A' AS index_size_summary OPTION    ( RECOMPILE );
+                                N'N/A' AS index_size_summary 
+						FROM #IndexSanity i
+						WHERE i.database_name NOT IN (                
+								SELECT   database_name
+								FROM     #IndexSanity
+								WHERE    filter_definition <> '' )
+						AND i.database_name NOT IN (
+						       SELECT  database_name
+							   FROM    #IndexSanity
+							   WHERE   is_indexed_view = 1 )
+						OPTION    ( RECOMPILE );
         END;
 
         RAISERROR(N'check_id 33: Potential filtered indexes based on column names.', 0,1) WITH NOWAIT;
@@ -2896,6 +2966,7 @@ BEGIN;
 									i.schema_name,
 									i.[object_id], 
                                     MAX(i.index_sanity_id) AS index_sanity_id,
+									ISNULL(NULLIF(MAX(DATEDIFF(DAY, i.create_date, SYSDATETIME())), 0), 1) AS create_days,
                                 ISNULL (
                                     CAST(SUM(CASE WHEN index_id NOT IN (0,1) THEN 1 ELSE 0 END)
                                          AS NVARCHAR(30))+ N' NC indexes exist (' + 
@@ -2953,8 +3024,9 @@ BEGIN;
                                 LEFT JOIN index_size_cte sz ON mi.[object_id] = sz.object_id 
 										  AND mi.database_id = sz.database_id
 										  AND mi.schema_name = sz.schema_name
-                                        /* Minimum benefit threshold = 100k/day of uptime */
-                        WHERE ( @Mode = 4 AND (magic_benefit_number/@DaysUptime) >= 100000 ) OR (magic_benefit_number/@DaysUptime) >= 100000
+                                        /* Minimum benefit threshold = 100k/day of uptime OR since table creation date, whichever is lower*/
+                        WHERE ( @Mode = 4 AND (magic_benefit_number / CASE WHEN sz.create_days < @DaysUptime THEN sz.create_days ELSE @DaysUptime END) >= 100000 ) 
+						OR (magic_benefit_number / CASE WHEN sz.create_days < @DaysUptime THEN sz.create_days ELSE @DaysUptime END) >= 100000
                         ) AS t
                         WHERE t.rownum <= CASE WHEN (@Mode <> 4) THEN 20 ELSE t.rownum END
                         ORDER BY t.is_low, magic_benefit_number DESC
@@ -4204,29 +4276,42 @@ BEGIN;
     END /* End @Mode=2 (index detail)*/
     ELSE IF @Mode=3 /*Missing index Detail*/
     BEGIN
+
+	WITH create_date AS (
+					SELECT i.database_id,
+						   i.schema_name,
+						   i.[object_id], 
+						   ISNULL(NULLIF(MAX(DATEDIFF(DAY, i.create_date, SYSDATETIME())), 0), 1) AS create_days
+					FROM #IndexSanity AS i
+					GROUP BY i.database_id, i.schema_name, i.object_id
+					)
         SELECT 
-            database_name AS [Database Name], 
-            [schema_name] AS [Schema], 
-            table_name AS [Table], 
-            CAST((magic_benefit_number/@DaysUptime) AS BIGINT)
+            mi.database_name AS [Database Name], 
+            mi.[schema_name] AS [Schema], 
+            mi.table_name AS [Table], 
+            CAST((mi.magic_benefit_number / CASE WHEN cd.create_days < @DaysUptime THEN cd.create_days ELSE @DaysUptime END) AS BIGINT)
                 AS [Magic Benefit Number], 
-            missing_index_details AS [Missing Index Details], 
-            avg_total_user_cost AS [Avg Query Cost], 
-            avg_user_impact AS [Est Index Improvement], 
-            user_seeks AS [Seeks], 
-            user_scans AS [Scans],
-            unique_compiles AS [Compiles], 
-            equality_columns AS [Equality Columns], 
-            inequality_columns AS [Inequality Columns], 
-            included_columns AS [Included Columns], 
-            index_estimated_impact AS [Estimated Impact], 
-            create_tsql AS [Create TSQL], 
-            more_info AS [More Info],
+            mi.missing_index_details AS [Missing Index Details], 
+            mi.avg_total_user_cost AS [Avg Query Cost], 
+            mi.avg_user_impact AS [Est Index Improvement], 
+            mi.user_seeks AS [Seeks], 
+            mi.user_scans AS [Scans],
+            mi.unique_compiles AS [Compiles], 
+            mi.equality_columns AS [Equality Columns], 
+            mi.inequality_columns AS [Inequality Columns], 
+            mi.included_columns AS [Included Columns], 
+            mi.index_estimated_impact AS [Estimated Impact], 
+            mi.create_tsql AS [Create TSQL], 
+            mi.more_info AS [More Info],
             1 AS [Display Order],
-			is_low
-        FROM #MissingIndexes
-        /* Minimum benefit threshold = 100k/day of uptime */
-        WHERE (magic_benefit_number/@DaysUptime) >= 100000
+			mi.is_low
+        FROM #MissingIndexes AS mi
+		LEFT JOIN create_date AS cd
+		ON mi.[object_id] =  cd.object_id 
+		AND mi.database_id = cd.database_id
+		AND mi.schema_name = cd.schema_name
+        /* Minimum benefit threshold = 100k/day of uptime OR since table creation date, whichever is lower*/
+        WHERE (mi.magic_benefit_number / CASE WHEN cd.create_days < @DaysUptime THEN cd.create_days ELSE @DaysUptime END) >= 100000
         UNION ALL
         SELECT                 
             @ScriptVersionName,   

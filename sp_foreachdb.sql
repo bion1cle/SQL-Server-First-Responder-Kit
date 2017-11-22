@@ -1,13 +1,19 @@
 USE [master];
 GO
 
-IF OBJECT_ID('dbo.sp_foreachdb') IS  NULL
+IF OBJECT_ID('dbo.sp_foreachdb') IS NULL
     EXEC ('CREATE PROCEDURE dbo.sp_foreachdb AS RETURN 0');
 GO
 
 ALTER PROCEDURE dbo.sp_foreachdb
-    @command NVARCHAR(MAX) ,
-    @replace_character NCHAR(1) = N'?' ,
+    -- Original fields from sp_MSforeachdb...
+    @command1 NVARCHAR(MAX) ,
+    @replacechar NCHAR(1) = N'?' ,
+    @command2 NVARCHAR(MAX) = NULL ,
+    @command3 NVARCHAR(MAX) = NULL ,
+    @precommand NVARCHAR(MAX) = NULL ,
+    @postcommand NVARCHAR(MAX) = NULL ,
+    -- Additional fields for our sp_foreachdb!
     @print_dbname BIT = 0 ,
     @print_command_only BIT = 0 ,
     @suppress_quotename BIT = 0 ,
@@ -22,10 +28,15 @@ ALTER PROCEDURE dbo.sp_foreachdb
     @is_read_only BIT = 0 ,
     @is_auto_close_on BIT = NULL ,
     @is_auto_shrink_on BIT = NULL ,
-    @is_broker_enabled BIT = NULL
+    @is_broker_enabled BIT = NULL , 
+	@VersionDate DATETIME = NULL OUTPUT
 AS
     BEGIN
         SET NOCOUNT ON;
+		DECLARE @Version VARCHAR(30);
+		SET @Version = '1.9.5';
+		SET @VersionDate = '20171115';
+
 
         DECLARE @sql NVARCHAR(MAX) ,
             @dblist NVARCHAR(MAX) ,
@@ -106,9 +117,9 @@ AS
                    THEN ' AND name NOT IN (' + @exlist + ')'
                    ELSE ''
               END + CASE WHEN @name_pattern <> N'%'
-                         THEN ' AND name LIKE N''%' + REPLACE(@name_pattern,
+                         THEN ' AND name LIKE N''' + REPLACE(@name_pattern,
                                                               '''', '''''')
-                              + '%'''
+                              + ''''
                          ELSE ''
                     END + CASE WHEN @dblist IS NOT NULL
                                THEN ' AND name IN (' + @dblist + ')'
@@ -162,7 +173,9 @@ AS
 
         WHILE @@FETCH_STATUS = 0
             BEGIN
-                SET @sql = REPLACE(@command, @replace_character, @db);
+                SET @sql = REPLACE(@command1, @replacechar, @db);
+
+                IF @suppress_quotename = 0 SET @sql = REPLACE(REPLACE(@sql,'[[','['),']]',']');
 
                 IF @print_command_only = 1
                     BEGIN
